@@ -36,10 +36,16 @@ import time
 import os
 import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
+
+# Suppress TF logs and optimize CPU threading for local machine
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+tf.config.threading.set_intra_op_parallelism_threads(4)
+tf.config.threading.set_inter_op_parallelism_threads(4)
 
 # ==============================
 # CONFIG — must be identical to 02_train_model.py
@@ -103,10 +109,20 @@ if not os.path.exists(MODEL_PATH):
 
 model = tf.keras.models.load_model(MODEL_PATH, compile=False)
 
+# Warm up model — first predict() call is always slow due to JIT compilation.
+# Running a dummy prediction here means the first real frame is fast.
+_dummy = np.zeros((1, SEQUENCE_LENGTH, FEATURE_SIZE), dtype=np.float32)
+model.predict(_dummy, verbose=0)
+print("✅ Model warmed up")
+
 with open(LABEL_PATH, "r") as f:
     LABELS = json.load(f)
 
 print(f"✅ Model loaded | {len(LABELS)} classes: {LABELS}")
+
+# Thread pool for running model.predict() without blocking MediaPipe.
+# 1 worker — TF model is not thread-safe for concurrent calls.
+_infer_pool = ThreadPoolExecutor(max_workers=1)
 
 # ==============================
 # MEDIAPIPE  (single shared instance)
@@ -528,45 +544,51 @@ def _pad_sequence(frames: list, target_len: int) -> np.ndarray:
     return np.array(padded, dtype=np.float32)
 
 
+def _run_inference(seq: np.ndarray) -> tuple[int, float]:
+    """Run model.predict on a single sequence. Runs in thread pool."""
+    inp   = np.expand_dims(seq, axis=0)   # (1, 8, 204)
+    probs = model.predict(inp, verbose=0)[0]
+    idx   = int(np.argmax(probs))
+    return idx, float(probs[idx])
+
+
 def predict_multiscale(raw_buffer: deque):
     """
     Returns (best_idx, best_conf) or (None, None).
-
-    Supports early prediction via left-padding when buffer has fewer than
-    SEQUENCE_LENGTH frames. Stride=1 always runs (uses whatever is available).
-    Stride=2 only runs once 2×SEQUENCE_LENGTH frames are available.
+    Builds all sequences first, then submits all strides to the thread pool
+    concurrently so MediaPipe overlap is maximised.
     """
-    best_idx, best_conf = None, -1.0
-    buf = list(raw_buffer)
+    buf  = list(raw_buffer)
+    seqs = []
 
     for stride in STRIDES:
         needed = stride * SEQUENCE_LENGTH
-
         if stride == 1:
-            # Always attempt stride=1 — pad if needed
             if len(buf) < MIN_FRAMES_TO_START:
                 continue
             tail = buf[-needed:] if len(buf) >= needed else buf
-            seq  = _pad_sequence(tail[::stride] if stride > 1 else tail, SEQUENCE_LENGTH)
+            seqs.append(_pad_sequence(tail, SEQUENCE_LENGTH))
         else:
-            # Higher strides need enough frames to actually sample meaningfully
             if len(buf) < needed:
                 continue
             tail = buf[-needed:]
             seq  = np.array(tail[::stride], dtype=np.float32)
-            if len(seq) != SEQUENCE_LENGTH:
-                continue
+            if len(seq) == SEQUENCE_LENGTH:
+                seqs.append(seq)
 
-        inp   = np.expand_dims(seq, axis=0)  # (1, 8, 204)
-        probs = model.predict(inp, verbose=0)[0]
-        idx   = int(np.argmax(probs))
-        conf  = float(probs[idx])
+    if not seqs:
+        return None, None
 
+    # Submit all strides to thread pool and wait for results
+    futures = [_infer_pool.submit(_run_inference, seq) for seq in seqs]
+    best_idx, best_conf = None, -1.0
+    for f in futures:
+        idx, conf = f.result()
         if conf > best_conf:
-            best_conf = conf
-            best_idx  = idx
+            best_conf, best_idx = conf, idx
 
     return (best_idx, best_conf) if best_idx is not None else (None, None)
+
 
 # ==============================
 # IMAGE DECODING
@@ -827,17 +849,18 @@ def predict(req: PredictRequest):
         #    This prevents contaminating the buffer with partial-frame keypoints
         if user_visible:
             nonzero = np.count_nonzero(kp) / kp.size
+            print(f"  [QC] nonzero={nonzero:.3f}  "
+                  f"left={landmarks['left_hand']}  right={landmarks['right_hand']}  "
+                  f"face={landmarks['face']}  pose={landmarks['pose']}  "
+                  f"user_visible={user_visible}")
             if nonzero >= MIN_NONZERO:
                 kp_norm = normalize_keypoints(kp)
                 sess.raw_buffer.append(kp_norm)
                 sess.accepted += 1
+            else:
+                print(f"  [QC] REJECTED — nonzero={nonzero:.3f} < MIN_NONZERO={MIN_NONZERO}")
         else:
-            # User stepped out of frame — clear buffer so stale frames
-            # don't pollute next prediction when they return
-            if len(sess.raw_buffer) > 0:
-                sess.raw_buffer.clear()
-                sess.smooth_buffer.clear()
-                sess.still_frame_count = 0
+            print(f"  [QC] BLOCKED — user_visible=False reason='{visibility_reason}'")
 
         buf_size  = len(sess.raw_buffer)
         ready     = buf_size >= MIN_FRAMES_TO_START and user_visible
@@ -846,7 +869,7 @@ def predict(req: PredictRequest):
         conf = 0.0
 
         # 9. Motion-aware inference — only when user is visible
-        if ready and user_visible and sess.should_predict and sess.accepted % 2 == 0:
+        if ready and user_visible and sess.should_predict:
             best_idx, best_conf = predict_multiscale(sess.raw_buffer)
 
             if best_idx is not None and best_conf >= CONF_THRESHOLD:
