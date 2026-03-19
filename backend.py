@@ -34,9 +34,10 @@ import json
 import base64
 import time
 import os
+import asyncio
 import threading
+import queue
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -80,7 +81,7 @@ STATIC_THRESHOLD  = 0.015  # wrist displacement/frame → holding still
 DYNAMIC_THRESHOLD = 0.030  # wrist displacement/frame → actively moving
 
 # Static mode: how many consecutive still frames before we emit a prediction
-STATIC_CONFIRM_FRAMES = 4   # ~400ms at 100ms throttle
+STATIC_CONFIRM_FRAMES = 2   # wait 2 still frames before predicting again (~200ms)
 
 # Dynamic mode: smoothing window — wider to capture full motion arc
 DYNAMIC_SMOOTHING = 5
@@ -120,9 +121,60 @@ with open(LABEL_PATH, "r") as f:
 
 print(f"✅ Model loaded | {len(LABELS)} classes: {LABELS}")
 
-# Thread pool for running model.predict() without blocking MediaPipe.
-# 1 worker — TF model is not thread-safe for concurrent calls.
-_infer_pool = ThreadPoolExecutor(max_workers=1)
+# ==============================
+# INFERENCE WORKER
+# ==============================
+# One dedicated background thread owns MediaPipe + TF forever.
+# The FastAPI async endpoint puts work on _work_queue and awaits a Future.
+# The worker thread gets work, processes it, sets the Future result.
+# Zero locks needed — only one thread ever touches MediaPipe/TF.
+#
+#  asyncio (main thread)          worker thread
+#  ─────────────────────          ─────────────
+#  future = asyncio.Future()
+#  _work_queue.put((frame,        ← queue.put (non-blocking)
+#                   session,
+#                   future))
+#  result = await future          worker: queue.get()
+#                                         MediaPipe(frame)
+#                                         model.predict()
+#                            →            future.set_result(prediction)
+#  return result
+
+_work_queue: queue.Queue = queue.Queue()
+_loop: asyncio.AbstractEventLoop | None = None   # set at startup
+
+
+def _worker_thread():
+    """
+    Dedicated thread that processes frames one at a time.
+    Runs forever, never touches asyncio — only calls set_result via loop.
+    """
+    while True:
+        item = _work_queue.get()
+        if item is None:          # shutdown signal
+            break
+
+        frame, sess, req_body, future = item
+        try:
+            result = _process_frame(frame, sess, req_body)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            result = e
+
+        # Schedule future resolution back on the asyncio event loop
+        if _loop is not None:
+            if isinstance(result, Exception):
+                _loop.call_soon_threadsafe(future.set_exception, result)
+            else:
+                _loop.call_soon_threadsafe(future.set_result, result)
+
+
+# Start worker thread at import time
+_worker = threading.Thread(target=_worker_thread, daemon=True)
+_worker.start()
+print("✅ Inference worker thread started")
 
 # ==============================
 # MEDIAPIPE  (single shared instance)
@@ -148,12 +200,13 @@ class SessionState:
         # Motion tracking
         self.velocity_history  = deque(maxlen=VELOCITY_HISTORY_LEN)
         self.prev_wrist_pos    = None
-        self.prev_spread       = None    # previous fingertip spread value
+        self.prev_spread       = None
         self.still_frame_count = 0
         self.motion_state      = 'static'
         self.arc_started       = False
         self.last_emitted_sign = None
         self.buffer_cleared    = False
+        self.last_predicted_at = 0
 
     @property
     def is_dual_hand(self) -> bool:
@@ -251,12 +304,11 @@ class SessionState:
             self.motion_state      = 'dynamic'
             self.arc_started       = True
             self.still_frame_count = 0
-            # ── KEY FIX ──────────────────────────────────────────────────────
             # First frame of motion after being static = sign transition.
-            # Clear the raw buffer immediately so old-sign frames don't
-            # contaminate the next prediction.
+            # Clear both raw and smooth buffers so old sign doesn't contaminate.
             if prev_state in ('static', 'settling'):
-                self.buffer_cleared = True   # signal to predict() to flush
+                self.buffer_cleared = True   # signal to predict() to flush raw_buffer
+                self.smooth_buffer  = deque(maxlen=self.smooth_buffer.maxlen)  # clear votes
             # Widen smoothing buffer for dynamic mode
             if self.smooth_buffer.maxlen != DYNAMIC_SMOOTHING:
                 old = list(self.smooth_buffer)
@@ -281,14 +333,19 @@ class SessionState:
     @property
     def should_predict(self) -> bool:
         """
-        Static  → predict after STATIC_CONFIRM_FRAMES still frames
+        Static  → predict once buffer has MIN_FRAMES_TO_START frames,
+                  then every STATIC_CONFIRM_FRAMES still frames after that.
+                  Once buffer is full (RAW_BUFFER_LEN), predict every frame.
         Dynamic → don't predict mid-motion
         Settling → predict once (arc just completed)
         """
-        if self.motion_state == 'static':
-            return self.still_frame_count >= STATIC_CONFIRM_FRAMES
         if self.motion_state == 'settling':
             return True
+        if self.motion_state == 'static':
+            # Always predict if buffer is full — no need to wait for still frames
+            if len(self.raw_buffer) >= RAW_BUFFER_LEN:
+                return True
+            return self.still_frame_count >= STATIC_CONFIRM_FRAMES
         return False  # dynamic — wait for arc to complete
 
     def mark_settling_done(self):
@@ -545,21 +602,26 @@ def _pad_sequence(frames: list, target_len: int) -> np.ndarray:
 
 
 def _run_inference(seq: np.ndarray) -> tuple[int, float]:
-    """Run model.predict on a single sequence. Runs in thread pool."""
-    inp   = np.expand_dims(seq, axis=0)   # (1, 8, 204)
-    probs = model.predict(inp, verbose=0)[0]
-    idx   = int(np.argmax(probs))
-    return idx, float(probs[idx])
+    """Run model.predict directly. Safe — only called sequentially."""
+    try:
+        inp   = np.expand_dims(seq, axis=0)
+        probs = model.predict(inp, verbose=0)[0]
+        idx   = int(np.argmax(probs))
+        return idx, float(probs[idx])
+    except Exception as e:
+        import traceback
+        print(f"  [INFER] error: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return -1, 0.0
 
 
 def predict_multiscale(raw_buffer: deque):
     """
     Returns (best_idx, best_conf) or (None, None).
-    Builds all sequences first, then submits all strides to the thread pool
-    concurrently so MediaPipe overlap is maximised.
+    Runs each stride sequentially — concurrent inference causes TF errors.
     """
     buf  = list(raw_buffer)
-    seqs = []
+    best_idx, best_conf = None, -1.0
 
     for stride in STRIDES:
         needed = stride * SEQUENCE_LENGTH
@@ -567,24 +629,17 @@ def predict_multiscale(raw_buffer: deque):
             if len(buf) < MIN_FRAMES_TO_START:
                 continue
             tail = buf[-needed:] if len(buf) >= needed else buf
-            seqs.append(_pad_sequence(tail, SEQUENCE_LENGTH))
+            seq  = _pad_sequence(tail, SEQUENCE_LENGTH)
         else:
             if len(buf) < needed:
                 continue
             tail = buf[-needed:]
             seq  = np.array(tail[::stride], dtype=np.float32)
-            if len(seq) == SEQUENCE_LENGTH:
-                seqs.append(seq)
+            if len(seq) != SEQUENCE_LENGTH:
+                continue
 
-    if not seqs:
-        return None, None
-
-    # Submit all strides to thread pool and wait for results
-    futures = [_infer_pool.submit(_run_inference, seq) for seq in seqs]
-    best_idx, best_conf = None, -1.0
-    for f in futures:
-        idx, conf = f.result()
-        if conf > best_conf:
+        idx, conf = _run_inference(seq)
+        if idx >= 0 and conf > best_conf:
             best_conf, best_idx = conf, idx
 
     return (best_idx, best_conf) if best_idx is not None else (None, None)
@@ -594,13 +649,19 @@ def predict_multiscale(raw_buffer: deque):
 # IMAGE DECODING
 # ==============================
 def decode_frame(b64: str) -> np.ndarray:
+    if not b64 or len(b64) < 10:
+        raise ValueError(f"Empty or too-short frame data (len={len(b64)})")
     if "," in b64:
         b64 = b64.split(",")[1]
-    buf   = base64.b64decode(b64)
+    try:
+        buf = base64.b64decode(b64)
+    except Exception as e:
+        raise ValueError(f"Invalid base64 data: {e}")
     arr   = np.frombuffer(buf, dtype=np.uint8)
     frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if frame is None:
-        raise ValueError("Could not decode image")
+        raise ValueError(f"cv2.imdecode failed — buffer len={len(buf)}, "
+                         f"possible corrupt JPEG or wrong crop dimensions")
     return frame
 
 # ==============================
@@ -775,14 +836,119 @@ def debug_get_overlay():
                         filename="debug_last_overlay.jpg")
 
 
-@app.post("/predict", response_model=PredictResponse)
-def predict(req: PredictRequest):
+
+def _process_frame(frame: np.ndarray, sess: SessionState,
+                   req: 'PredictRequest') -> 'PredictResponse':
+    """
+    All MediaPipe + TF work happens here.
+    Called ONLY from _worker_thread — never from asyncio directly.
+    """
     start = time.time()
 
-    # Handle reset
+    # 1. Run MediaPipe
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    rgb.flags.writeable = False
+    results = holistic.process(rgb)
+
+    # 2. Debug
+    global _debug_frame_counter
+    _debug_frame_counter += 1
+    if _debug_enabled and _debug_frame_counter % _debug_save_every == 0:
+        threading.Thread(
+            target=_save_debug_frame,
+            args=(frame.copy(), results, _debug_frame_counter),
+            daemon=True
+        ).start()
+
+    # 3. Visibility
+    user_visible, visibility_reason = check_user_visibility(results)
+
+    # 4. Landmarks
+    landmarks = {
+        "left_hand"  : results.left_hand_landmarks  is not None,
+        "right_hand" : results.right_hand_landmarks is not None,
+        "pose"       : results.pose_landmarks       is not None,
+        "face"       : results.face_landmarks       is not None,
+    }
+
+    # 5. Dual-hand
+    hands_this_frame = sum([
+        results.left_hand_landmarks  is not None,
+        results.right_hand_landmarks is not None,
+    ])
+    sess.hand_history.append(hands_this_frame == 2)
+    is_dual = sess.is_dual_hand
+
+    # 6. Keypoints
+    kp = extract_keypoints(results, is_dual_hand=is_dual)
+
+    # 7. Motion
+    velocity = sess.update_motion(kp)
+
+    # 8. Buffer flush on sign transition
+    if sess.buffer_cleared:
+        sess.raw_buffer.clear()
+        sess.smooth_buffer.clear()
+        sess.buffer_cleared = False
+        print("  [MOTION] Sign transition — buffer cleared")
+
+    # 9. Quality gate
+    if user_visible:
+        nonzero = np.count_nonzero(kp) / kp.size
+        if nonzero >= MIN_NONZERO:
+            kp_norm = normalize_keypoints(kp)
+            sess.raw_buffer.append(kp_norm)
+            sess.accepted += 1
+    else:
+        if len(sess.raw_buffer) > 0:
+            sess.raw_buffer.clear()
+            sess.smooth_buffer.clear()
+            sess.still_frame_count = 0
+
+    buf_size = len(sess.raw_buffer)
+    ready    = buf_size >= MIN_FRAMES_TO_START and user_visible
+
+    sign = None
+    conf = 0.0
+
+    # 10. Inference
+    if ready and user_visible and sess.should_predict:
+        best_idx, best_conf = predict_multiscale(sess.raw_buffer)
+        if best_idx is not None and best_conf >= CONF_THRESHOLD:
+            sess.smooth_buffer.append(best_idx)
+            majority = int(np.bincount(
+                np.array(sess.smooth_buffer, dtype=np.int32)).argmax())
+            sign = LABELS[majority]
+            conf = best_conf
+            sess.mark_predicted()
+            if sess.motion_state == 'settling':
+                sess.mark_settling_done()
+                sess.smooth_buffer.clear()
+        else:
+            sess.smooth_buffer.clear()
+
+    ms = round((time.time() - start) * 1000, 2)
+    return PredictResponse(
+        sign=sign, confidence=conf,
+        buffer_size=buf_size, ready=ready,
+        landmarks=landmarks, processing_ms=ms,
+        dual_hand_detected=sess.is_dual_hand,
+        motion_state=sess.motion_state,
+        velocity=round(velocity, 4),
+        user_visible=user_visible,
+        visibility_reason=visibility_reason,
+    )
+
+
+@app.post("/predict", response_model=PredictResponse)
+async def predict(req: PredictRequest):
+    """
+    Async endpoint — never blocks the event loop.
+    Decodes the frame, creates a Future, puts work on the queue,
+    then awaits the Future which the worker thread resolves.
+    """
     if req.reset:
-        if req.session_id in sessions:
-            del sessions[req.session_id]
+        sessions.pop(req.session_id, None)
         return PredictResponse(
             sign=None, confidence=0.0, buffer_size=0,
             ready=False, landmarks={}, processing_ms=0.0,
@@ -790,117 +956,34 @@ def predict(req: PredictRequest):
             user_visible=False, visibility_reason='reset'
         )
 
-    sess = get_session(req.session_id)
-
     try:
-        # 1. Decode frame
         frame = decode_frame(req.frame)
-
-        # 2. Run MediaPipe Holistic
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb.flags.writeable = False
-        results = holistic.process(rgb)
-
-        # ── Debug: save frame + overlay every N frames ──
-        global _debug_frame_counter
-        _debug_frame_counter += 1
-        if _debug_enabled and _debug_frame_counter % _debug_save_every == 0:
-            threading.Thread(
-                target=_save_debug_frame,
-                args=(frame.copy(), results, _debug_frame_counter),
-                daemon=True
-            ).start()
-
-        # 3. Check user is properly framed
-        user_visible, visibility_reason = check_user_visibility(results)
-
-        # 4. Track landmarks
-        landmarks = {
-            "left_hand"  : results.left_hand_landmarks  is not None,
-            "right_hand" : results.right_hand_landmarks is not None,
-            "pose"       : results.pose_landmarks       is not None,
-            "face"       : results.face_landmarks       is not None,
-        }
-
-        # 5. Auto dual-hand detection
-        hands_this_frame = sum([
-            results.left_hand_landmarks  is not None,
-            results.right_hand_landmarks is not None,
-        ])
-        sess.hand_history.append(hands_this_frame == 2)
-        is_dual = sess.is_dual_hand
-
-        # 6. Extract + normalize keypoints
-        kp = extract_keypoints(results, is_dual_hand=is_dual)
-
-        # 7. Update motion state
-        velocity = sess.update_motion(kp)
-
-        # ── Buffer flush on sign transition ──────────────────────────────────
-        # When motion starts after being still, the old sign's frames are stale.
-        # Clear immediately so the new sign fills a clean buffer.
-        if sess.buffer_cleared:
-            sess.raw_buffer.clear()
-            sess.smooth_buffer.clear()
-            sess.buffer_cleared = False
-            print(f"  [MOTION] Sign transition — buffer cleared")
-
-        # 8. Quality gate — only add to buffer when user is properly visible
-        #    This prevents contaminating the buffer with partial-frame keypoints
-        if user_visible:
-            nonzero = np.count_nonzero(kp) / kp.size
-            print(f"  [QC] nonzero={nonzero:.3f}  "
-                  f"left={landmarks['left_hand']}  right={landmarks['right_hand']}  "
-                  f"face={landmarks['face']}  pose={landmarks['pose']}  "
-                  f"user_visible={user_visible}")
-            if nonzero >= MIN_NONZERO:
-                kp_norm = normalize_keypoints(kp)
-                sess.raw_buffer.append(kp_norm)
-                sess.accepted += 1
-            else:
-                print(f"  [QC] REJECTED — nonzero={nonzero:.3f} < MIN_NONZERO={MIN_NONZERO}")
-        else:
-            print(f"  [QC] BLOCKED — user_visible=False reason='{visibility_reason}'")
-
-        buf_size  = len(sess.raw_buffer)
-        ready     = buf_size >= MIN_FRAMES_TO_START and user_visible
-
-        sign = None
-        conf = 0.0
-
-        # 9. Motion-aware inference — only when user is visible
-        if ready and user_visible and sess.should_predict:
-            best_idx, best_conf = predict_multiscale(sess.raw_buffer)
-
-            if best_idx is not None and best_conf >= CONF_THRESHOLD:
-                sess.smooth_buffer.append(best_idx)
-                majority = int(np.bincount(
-                    np.array(sess.smooth_buffer, dtype=np.int32)).argmax())
-                sign = LABELS[majority]
-                conf = best_conf
-
-                if sess.motion_state == 'settling':
-                    sess.mark_settling_done()
-                    sess.smooth_buffer.clear()
-            else:
-                sess.smooth_buffer.clear()
-
-        ms = round((time.time() - start) * 1000, 2)
-        return PredictResponse(
-            sign=sign, confidence=conf,
-            buffer_size=buf_size, ready=ready,
-            landmarks=landmarks, processing_ms=ms,
-            dual_hand_detected=sess.is_dual_hand,
-            motion_state=sess.motion_state,
-            velocity=round(velocity, 4),
-            user_visible=user_visible,
-            visibility_reason=visibility_reason,
-        )
-
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    sess   = get_session(req.session_id)
+    loop   = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+
+    _work_queue.put((frame, sess, req, future))
+
+    try:
+        result = await asyncio.wait_for(future, timeout=10.0)
+        return result
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Inference timeout")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Server error: {e}")
+
+
+@app.on_event("startup")
+async def startup():
+    global _loop
+    _loop = asyncio.get_running_loop()
+    print("✅ Event loop captured — worker thread ready")
+
 
 @app.delete("/session/{session_id}")
 def clear_session(session_id: str):
