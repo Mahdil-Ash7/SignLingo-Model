@@ -1,0 +1,8 @@
+BIM Sign Language — Confusion Analysis Report
+============================================================
+
+Per-Class Accuracy:
+  B                    100.0%  (40 sequences)
+  E                    100.0%  (40 sequences)
+
+Top Confused Pairs:
