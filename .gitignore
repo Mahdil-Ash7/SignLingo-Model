@@ -18,3 +18,6 @@ Thumbs.db
 # Debug images
 debug_last_frame.jpg
 debug_last_overlay*.jpg
+
+debug_frames/*
+!debug_frames/.gitkeep

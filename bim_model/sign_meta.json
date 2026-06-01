@@ -1,0 +1,292 @@
+{
+  "A": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "B": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "C": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "D": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "E": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "F": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "G": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "H": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "I": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "J": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "K": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "L": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "M": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "N": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "O": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "P": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "Q": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "R": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "S": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "T": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "U": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "V": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "W": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "X": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "Y": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "Z": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "2": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "Biru": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "Hijau": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "Hitam": {
+    "tracked_face": true,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "Jingga": {
+    "tracked_face": true,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "Kelabu": {
+    "tracked_face": true,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "Kuning": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "Merah": {
+    "tracked_face": true,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "Merah Jambu": {
+    "tracked_face": true,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "Perang (Warna)": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "Putih": {
+    "tracked_face": false,
+    "tracked_pose": true,
+    "is_dynamic": true
+  },
+  "Ungu": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "Warna": {
+    "tracked_face": true,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "1": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "10": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "11": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "12": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "13": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "14": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "15": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "16": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "17": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "18": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "19": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "20": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": true
+  },
+  "3": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "4": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "5": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "6": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "7": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "8": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  },
+  "9": {
+    "tracked_face": false,
+    "tracked_pose": false,
+    "is_dynamic": false
+  }
+}
