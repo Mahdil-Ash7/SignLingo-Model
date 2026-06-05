@@ -1,5 +1,3 @@
 {
-  "is_dynamic": false,
-  "tracked_face": false,
-  "tracked_pose": false
+  "is_dynamic": false
 }
